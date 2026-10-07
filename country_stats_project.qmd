@@ -1,0 +1,1088 @@
+# Project Overview
+
+This project studies how geography, population structure, human development, digital access, demographic outcomes, and external debt are related across countries. Rather than relying on a single model or a single outcome, the analysis uses several supervised learning tasks plus an unsupervised clustering analysis.
+
+The five research questions are:
+
+1. **RQ1 — Human Development:** How well can HDI be predicted from demographic, geographic, digital-access, and economic variables, and which features matter most?
+2. **RQ2 — Fertility:** Which country characteristics are most useful for predicting fertility rate?
+3. **RQ3 — Mortality:** Can the available country-level variables explain mortality rate well, or is important information missing from this dataset?
+4. **RQ4 — External Debt:** Which country characteristics are associated with external debt, after accounting for the strong skew in debt values?
+5. **RQ5 — Country Profiles:** Do countries naturally form distinct development/demographic profiles without using a predefined target?
+
+For each supervised question, Ridge Regression, Random Forest, and Extra Trees are compared. The best model is selected by **5-fold cross-validated MAE**. R-squared is reported as a secondary metric. Feature importance is then estimated with permutation importance for the selected model. This makes the model comparison consistent across research questions.
+
+> **Interpretation note:** These are observational country-level data. Feature importance and predictive performance show association and predictive usefulness, not causation.
+
+# 1. Setup and Data Preparation
+
+## 1.1 Import Packages
+
+```{python}
+import warnings
+warnings.filterwarnings("ignore")
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import clone
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.decomposition import PCA
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    silhouette_score,
+)
+from sklearn.model_selection import KFold, cross_val_predict, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+
+RANDOM_STATE = 42
+CV = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+```
+
+## 1.2 Load and Clean the Dataset
+
+The code assumes that `country_stats.csv` is in the same folder as this `.qmd` file.
+
+```{python}
+DATA_PATH = Path("country_stats.csv")
+
+df = pd.read_csv(DATA_PATH)
+
+# Convert external debt from text such as "3,468.2119" to numeric.
+df["External debt (billions)"] = pd.to_numeric(
+    df["External debt (billions)"].astype(str).str.replace(",", "", regex=False),
+    errors="coerce"
+)
+
+print("Dataset shape:", df.shape)
+display(df.head())
+```
+
+## 1.3 Data Quality Check
+
+```{python}
+summary = pd.DataFrame({
+    "Data Type": df.dtypes.astype(str),
+    "Missing Values": df.isna().sum(),
+    "Unique Values": df.nunique(dropna=False)
+})
+
+display(summary)
+```
+
+```{python}
+numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+display(df[numeric_cols].describe().T)
+```
+
+## 1.4 Exploratory Correlation Map
+
+This heatmap is useful because it reveals broad relationships before modeling. It also helps identify highly related variables that may carry overlapping information.
+
+```{python}
+corr = df[numeric_cols].corr()
+
+fig, ax = plt.subplots(figsize=(12, 9))
+im = ax.imshow(corr, aspect="auto", vmin=-1, vmax=1, cmap="coolwarm")
+n = len(corr.columns)
+ax.set_xticks(range(n))
+ax.set_yticks(range(n))
+ax.set_xticklabels(corr.columns, rotation=75, ha="right")
+ax.set_yticklabels(corr.columns)
+ax.set_title("Correlation Matrix of Country-Level Variables")
+fig.colorbar(im, ax=ax, label="Pearson correlation")
+plt.tight_layout()
+plt.show()
+```
+
+# 2. Reusable Modeling Functions
+
+The same evaluation framework is used for all supervised research questions. Missing predictor values are imputed inside each model pipeline, preventing preprocessing from being performed before cross-validation.
+
+```{python}
+def build_regression_models():
+    return {
+        "Ridge Regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=1.0))
+        ]),
+        "Random Forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", RandomForestRegressor(
+                n_estimators=250,
+                min_samples_leaf=2,
+                random_state=RANDOM_STATE,
+                n_jobs=1
+            ))
+        ]),
+        "Extra Trees": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", ExtraTreesRegressor(
+                n_estimators=250,
+                min_samples_leaf=2,
+                random_state=RANDOM_STATE,
+                n_jobs=1
+            ))
+        ])
+    }
+
+
+def compare_regression_models(X, y, log_target=False):
+    rows = []
+    fitted_candidates = {}
+
+    for name, base_model in build_regression_models().items():
+        if log_target:
+            model = TransformedTargetRegressor(
+                regressor=base_model,
+                func=np.log1p,
+                inverse_func=np.expm1
+            )
+        else:
+            model = base_model
+
+        scores = cross_validate(
+            model,
+            X,
+            y,
+            cv=CV,
+            scoring={
+                "mae": "neg_mean_absolute_error",
+                "rmse": "neg_root_mean_squared_error",
+                "r2": "r2"
+            },
+            n_jobs=-1
+        )
+
+        rows.append({
+            "Model": name,
+            "MAE": -scores["test_mae"].mean(),
+            "RMSE": -scores["test_rmse"].mean(),
+            "R2": scores["test_r2"].mean()
+        })
+        fitted_candidates[name] = model
+
+    results = pd.DataFrame(rows).sort_values("MAE").reset_index(drop=True)
+    best_name = results.loc[0, "Model"]
+    best_model = clone(fitted_candidates[best_name])
+    best_model.fit(X, y)
+
+    return results, best_name, best_model
+
+
+def plot_cv_predictions(model, X, y, title):
+    pred = cross_val_predict(model, X, y, cv=CV, n_jobs=-1)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(y, pred, alpha=0.75)
+    low = min(y.min(), pred.min())
+    high = max(y.max(), pred.max())
+    ax.plot([low, high], [low, high], linestyle="--")
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Cross-Validated Prediction")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+
+    return pd.DataFrame({"Actual": y, "Predicted": pred})
+
+
+def permutation_importance_table(model, X, y, top_n=10):
+    result = permutation_importance(
+        model,
+        X,
+        y,
+        scoring="neg_mean_absolute_error",
+        n_repeats=10,
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+
+    imp = pd.DataFrame({
+        "Feature": X.columns,
+        "Importance": result.importances_mean,
+        "Std": result.importances_std
+    }).sort_values("Importance", ascending=False).reset_index(drop=True)
+
+    return imp.head(top_n)
+
+
+def plot_importance(importance_df, title):
+    plot_df = importance_df.sort_values("Importance")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(plot_df["Feature"], plot_df["Importance"], xerr=plot_df["Std"])
+    ax.set_xlabel("Increase in MAE after permutation")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+```
+
+# 3. RQ1 — What Predicts Human Development (HDI)?
+
+## 3.1 Research Rationale
+
+HDI is a broad development outcome. This question tests whether differences in development can be predicted from population structure, geography, fertility, mortality, internet access, and debt. The analysis is predictive rather than causal.
+
+## 3.2 Model Comparison
+
+```{python}
+rq1_target = "HDI"
+rq1_features = [
+    "Total in km2",
+    "Land in km2",
+    "Inland water in km2",
+    "% water",
+    "Population",
+    "% of world population",
+    "Population density",
+    "Fertility rate",
+    "Mortality rate",
+    "% of internet users in population",
+    "External debt (billions)"
+]
+
+rq1 = df[rq1_features + [rq1_target]].dropna(subset=[rq1_target]).copy()
+X1 = rq1[rq1_features]
+y1 = rq1[rq1_target]
+
+rq1_results, rq1_best_name, rq1_best_model = compare_regression_models(X1, y1)
+
+display(rq1_results)
+print("Selected model:", rq1_best_name)
+```
+
+
+# RQ1 Model Comparison Analysis:
+Extra Trees achieved the best overall predictive performance, with the lowest MAE (0.0479) and RMSE (0.0635), as well as the highest R² (0.8123). This indicates that the model explains approximately 81.2% of the variation in HDI in the test data. Random Forest performed similarly but was slightly less accurate, while Ridge Regression produced the weakest results among the three models. The stronger performance of the tree-based models suggests that the relationships between country-level characteristics and HDI may include nonlinear patterns and interactions that are not fully captured by a linear model.
+
+
+
+
+## 3.3 Actual vs. Predicted HDI
+
+```{python}
+rq1_predictions = plot_cv_predictions(
+    rq1_best_model,
+    X1,
+    y1,
+    "RQ1: Actual vs. Cross-Validated Predicted HDI"
+)
+```
+
+
+
+## 3.3 Actual vs. Predicted HDI Analysis:
+The cross-validated predictions generally follow the 45-degree reference line, indicating that the Extra Trees model captures a substantial portion of the variation in HDI across countries. The model achieved an R² of 0.8123, suggesting that approximately 81.2% of the variation in HDI can be explained by the predictors included in the model. Its MAE of 0.0479 also indicates that predictions differ from actual HDI values by approximately 0.048 points on average. However, several observations remain noticeably distant from the reference line, showing that the available country-level indicators do not fully explain HDI for every country. Overall, the results suggest that demographic, technological, and economic characteristics provide strong but incomplete predictive information about human development.
+
+
+
+## 3.4 Most Important Features
+
+```{python}
+rq1_importance = permutation_importance_table(rq1_best_model, X1, y1)
+display(rq1_importance)
+plot_importance(rq1_importance, "RQ1: Feature Importance for HDI")
+```
+
+
+
+## HDI Feature Importance Analysis:
+Internet usage was the most influential predictor of HDI, with a permutation importance of 0.0806, followed by fertility rate at 0.0498. Mortality rate and external debt showed considerably smaller contributions, while geographic and population-size variables had relatively limited predictive importance. This suggests that indicators related to technological access and demographic development contain substantially more information for predicting HDI than country size or population alone.
+However, these importance scores should not be interpreted as causal effects. For example, higher internet usage does not necessarily cause higher HDI. Instead, internet penetration may reflect broader differences in infrastructure, education, income, and economic development. Similarly, fertility rate may capture underlying demographic and socioeconomic conditions. Therefore, the results identify strong predictive relationships rather than direct causal relationships.
+
+
+
+## 3.5 Interpretation Guide
+
+A low MAE and high R-squared indicate that the available country characteristics contain substantial information about HDI. Features near the top of the permutation-importance table are the variables the selected model relies on most. However, importance does not prove that changing a feature would cause HDI to change.
+
+
+
+
+
+
+
+# 4. RQ2 — What Predicts Fertility Rate?
+
+## 4.1 Research Rationale
+
+Fertility reflects demographic behavior and may be associated with development, mortality, digital access, population structure, and geography. This question examines whether those relationships are strong enough to support useful prediction.
+
+## 4.2 Model Comparison
+
+```{python}
+rq2_target = "Fertility rate"
+rq2_features = [
+    "Total in km2",
+    "% water",
+    "Population",
+    "% of world population",
+    "Population density",
+    "HDI",
+    "Mortality rate",
+    "% of internet users in population",
+    "External debt (billions)"
+]
+
+rq2 = df[rq2_features + [rq2_target]].dropna(subset=[rq2_target]).copy()
+X2 = rq2[rq2_features]
+y2 = rq2[rq2_target]
+
+rq2_results, rq2_best_name, rq2_best_model = compare_regression_models(X2, y2)
+
+display(rq2_results)
+print("Selected model:", rq2_best_name)
+```
+
+
+
+# RQ2 Model Comparison Analysis:
+Extra Trees achieved the best predictive performance for fertility rate, with the lowest MAE (0.4125) and RMSE (0.5481) and the highest R² (0.7147). The R² indicates that approximately 71.5% of the variation in fertility rate can be explained by the country-level predictors included in the model. Random Forest produced similar but slightly weaker results, while Ridge Regression had the lowest predictive performance. The stronger performance of the two tree-based models suggests that fertility may be associated with nonlinear relationships and interactions among development, demographic, technological, and economic characteristics. However, the model does not explain all variation in fertility, indicating that additional social, cultural, institutional, or policy-related factors not represented in the dataset may also be important.
+
+
+
+
+## 4.3 Actual vs. Predicted Fertility
+
+```{python}
+rq2_predictions = plot_cv_predictions(
+    rq2_best_model,
+    X2,
+    y2,
+    "RQ2: Actual vs. Cross-Validated Predicted Fertility Rate"
+)
+```
+
+
+
+## 4.3 Actual vs. Predicted Fertility Prediction Analysis:
+The cross-validated predictions generally follow the 45-degree reference line, indicating that the Extra Trees model captures the overall pattern of fertility rates across countries. This is consistent with the model's R² of 0.7147, meaning that approximately 71.5% of the variation in fertility rate is explained by the predictors included in the model.
+However, prediction accuracy is not uniform across the full range of fertility rates. Countries with relatively low or moderate fertility rates are generally predicted more accurately, while several countries with very high actual fertility rates are underestimated by the model. A small number of substantial overpredictions are also visible. These errors suggest that extreme fertility patterns may depend on additional social, cultural, institutional, or policy-related factors that are not represented in the current dataset.
+Therefore, the model provides reasonably strong predictive performance overall, but it should be used cautiously when interpreting countries with unusually high fertility rates.
+
+
+
+## 4.4 Most Important Features
+
+```{python}
+rq2_importance = permutation_importance_table(rq2_best_model, X2, y2)
+display(rq2_importance)
+plot_importance(rq2_importance, "RQ2: Feature Importance for Fertility Rate")
+```
+
+
+
+# Fertility Feature Importance Analysis:
+HDI was the most influential predictor of fertility rate, with a permutation importance of 0.5880, followed by the percentage of internet users in the population (0.2949). Mortality rate ranked third but had substantially lower importance. In contrast, population size, population density, external debt, and geographic characteristics contributed relatively less to the model's predictive performance.
+An interesting pattern emerges when this result is considered together with RQ1. Fertility rate was one of the strongest predictors of HDI in RQ1, while HDI is the strongest predictor of fertility rate in RQ2. Internet usage is also highly important in both analyses. This suggests that human development, fertility, and technological access are strongly interconnected at the country level.
+However, these relationships should not be interpreted as causal. The analysis shows that these variables contain useful predictive information about one another, but it cannot establish whether changes in HDI directly cause changes in fertility or vice versa. They may instead reflect broader socioeconomic and demographic development patterns.
+
+
+
+
+
+
+## 4.5 Interpretation Guide
+
+This question is especially useful for comparing development-related variables such as HDI and internet use with more traditional demographic variables. If HDI or internet use ranks highly, it suggests that fertility differences are strongly associated with broader development patterns in this dataset.
+
+
+
+
+
+
+
+
+# 5. RQ3 — Can the Dataset Explain Mortality Rate Well?
+
+## 5.1 Research Rationale
+
+This is deliberately a more critical question. A model does not have to perform well for a research question to be valuable. If mortality cannot be predicted accurately from the available variables, that suggests the dataset may be missing important health-system, age-structure, disease, income, conflict, or environmental information.
+
+## 5.2 Model Comparison
+
+```{python}
+rq3_target = "Mortality rate"
+rq3_features = [
+    "Total in km2",
+    "% water",
+    "Population",
+    "% of world population",
+    "Population density",
+    "HDI",
+    "Fertility rate",
+    "% of internet users in population",
+    "External debt (billions)"
+]
+
+rq3 = df[rq3_features + [rq3_target]].dropna(subset=[rq3_target]).copy()
+X3 = rq3[rq3_features]
+y3 = rq3[rq3_target]
+
+rq3_results, rq3_best_name, rq3_best_model = compare_regression_models(X3, y3)
+
+display(rq3_results)
+print("Selected model:", rq3_best_name)
+```
+
+
+# 5. RQ3 Model Comparison Analysis:
+Extra Trees achieved the best performance for predicting mortality rate, with an MAE of 1.7406, RMSE of 2.3717, and R² of 0.2806. Random Forest produced nearly identical results, while Ridge Regression performed substantially worse and produced a negative R² of −0.3334.
+
+A negative R² essentially means that the model's predictive performance on this validation data is even worse than that of a very simple baseline—namely, using the average mortality rate to predict values ​​for all countries.
+
+Although Extra Trees was the best model among the three candidates, its predictive performance should still be considered weak. An R² of 0.2806 indicates that the available predictors explain only about 28.1% of the variation in mortality rate. The negative R² of Ridge Regression further suggests that a simple linear relationship is insufficient for predicting mortality using these variables.
+Therefore, this research question cannot be answered strongly with the current dataset. The results suggest that mortality depends on important factors that are not adequately represented here, potentially including healthcare access, population age structure, disease burden, income, nutrition, conflict, and public health conditions. The model should therefore be interpreted as identifying limited predictive structure rather than providing a reliable mortality prediction system.
+
+
+
+
+
+
+## 5.3 Actual vs. Predicted Mortality
+
+```{python}
+rq3_predictions = plot_cv_predictions(
+    rq3_best_model,
+    X3,
+    y3,
+    "RQ3: Actual vs. Cross-Validated Predicted Mortality Rate"
+)
+```
+
+
+
+## 5.3 Actual vs. Predicted Mortality Prediction Analysis:
+The cross-validated prediction plot confirms the relatively weak performance of the mortality model. Unlike the HDI and fertility models, the observations are not closely concentrated around the 45-degree reference line. Predictions are compressed toward the middle of the mortality-rate distribution.
+In particular, countries with very high actual mortality rates are substantially underpredicted, while several countries with very low mortality rates are overpredicted. This pattern indicates that the model has difficulty capturing extreme mortality conditions and tends to produce predictions closer to the average.
+This visual pattern is consistent with the relatively low R² of 0.2806. Therefore, although Extra Trees performs better than the other candidate models, the current set of predictors does not provide sufficient information for accurate mortality prediction. The results suggest that additional health, demographic, economic, and institutional variables would likely be necessary to explain mortality differences across countries more effectively.
+
+
+
+
+## 5.4 Most Important Features
+
+```{python}
+rq3_importance = permutation_importance_table(rq3_best_model, X3, y3)
+display(rq3_importance)
+plot_importance(rq3_importance, "RQ3: Feature Importance for Mortality Rate")
+```
+
+
+
+# 5. RQ3 Feature Importance Analysis:
+Fertility rate was the most influential predictor in the Extra Trees mortality model, followed by HDI and the percentage of internet users. These results suggest that demographic and development-related characteristics contain more predictive information about mortality than most geographic and population-size variables.
+However, feature importance must be interpreted in the context of the model's relatively weak overall performance. The best model achieved an R² of only 0.2806, meaning that the available predictors explain only a limited portion of the variation in mortality rates. Therefore, fertility rate should be described as the most important predictor within this model, rather than as a strong or sufficient explanation of mortality.
+The repeated importance of fertility rate, HDI, and internet usage across RQ1–RQ3 suggests that these variables capture an interconnected demographic and development pattern among countries. Nevertheless, the poor mortality prediction indicates that important determinants of mortality are likely missing from the dataset.
+
+
+
+
+
+
+
+
+## 5.5 Interpretation Guide
+
+Pay particular attention to cross-validated R-squared. If it is low or negative, the correct conclusion is **not** that the best model is successful. Instead, the available predictors do not explain mortality reliably enough for strong prediction. That limitation should be reported directly.
+
+
+
+
+
+
+
+
+
+# 6. RQ4 — What Predicts External Debt?
+
+## 6.1 Research Rationale
+
+External debt varies enormously across countries and is strongly right-skewed. This question tests whether geography, population size, development, demographic conditions, and digital access help explain cross-country debt differences.
+
+Because debt is highly skewed, the models are trained through a log transformation of the target and then transformed back to the original debt scale for evaluation.
+
+## 6.2 Distribution of External Debt
+
+```{python}
+debt_plot = df[["Country name", "External debt (billions)"]].dropna().copy()
+debt_plot = debt_plot.sort_values("External debt (billions)", ascending=False).head(15)
+
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.barh(
+    debt_plot["Country name"][::-1],
+    debt_plot["External debt (billions)"][::-1]
+)
+ax.set_xlabel("External Debt (Billions)")
+ax.set_title("Top 15 Countries by External Debt")
+plt.tight_layout()
+plt.show()
+```
+
+
+
+## 6.2 Distribution of External Debt Exploratory Analysis:
+External debt is highly concentrated among a relatively small number of countries. The United States has by far the largest external debt in the dataset, followed by the United Kingdom, France, and Germany. The substantial gap between the highest-debt countries and the rest of the sample indicates that the external debt variable is strongly right-skewed and contains extreme values.
+This distribution motivates the use of a logarithmic transformation of external debt in the predictive analysis. Modeling the raw debt values could cause a small number of extremely high-debt countries to dominate the model and its error metrics. The log transformation reduces this imbalance and allows the models to capture broader cross-country patterns more effectively.
+Importantly, high absolute external debt should not automatically be interpreted as poor economic performance. Larger economies and major international financial centers may naturally have larger cross-border debt positions. Therefore, this analysis focuses on predicting debt magnitude rather than evaluating national financial health.
+
+
+
+
+## 6.3 Model Comparison
+
+```{python}
+rq4_target = "External debt (billions)"
+rq4_features = [
+    "Total in km2",
+    "% water",
+    "Population",
+    "% of world population",
+    "Population density",
+    "HDI",
+    "Fertility rate",
+    "Mortality rate",
+    "% of internet users in population"
+]
+
+rq4 = df[rq4_features + [rq4_target]].dropna(subset=[rq4_target]).copy()
+X4 = rq4[rq4_features]
+y4 = rq4[rq4_target]
+
+rq4_results, rq4_best_name, rq4_best_model = compare_regression_models(
+    X4,
+    y4,
+    log_target=True
+)
+
+display(rq4_results)
+print("Selected model:", rq4_best_name)
+```
+
+
+# 6. RQ4 Model Comparison Analysis:
+Extra Trees achieved the lowest prediction errors, with an MAE of 436.34 billion and an RMSE of 1,620.40 billion, while Random Forest achieved a slightly higher R² of 0.4556 compared with 0.4494 for Extra Trees. Because MAE was used as the primary model-selection metric, Extra Trees was selected as the preferred model. However, the performance of Extra Trees and Random Forest was very similar.
+Overall, the predictive performance was moderate. The Extra Trees model explained approximately 44.9% of the variation in external debt, indicating that the available country-level characteristics provide some useful predictive information but are insufficient to explain most cross-country differences in debt magnitude.
+Ridge Regression performed extremely poorly, with an R² of −161.1959 and substantially larger prediction errors. This suggests that a simple linear relationship is not appropriate for modeling external debt in this dataset. The highly skewed debt distribution and the presence of a small number of countries with exceptionally large debt positions make the prediction problem particularly challenging.
+Therefore, external debt can be predicted to a limited extent using the available variables, but the model should not be considered highly reliable, particularly for countries with unusually large debt positions.
+
+
+
+
+## 6.4 Actual vs. Predicted External Debt
+
+A log scale is used in the figure because a few countries have extremely large debt values.
+
+```{python}
+rq4_predictions = plot_cv_predictions(
+    rq4_best_model,
+    X4,
+    y4,
+    "RQ4: Actual vs. Cross-Validated Predicted External Debt"
+)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.scatter(rq4_predictions["Actual"], rq4_predictions["Predicted"], alpha=0.75)
+positive = rq4_predictions[(rq4_predictions["Actual"] > 0) & (rq4_predictions["Predicted"] > 0)]
+low = min(positive["Actual"].min(), positive["Predicted"].min())
+high = max(positive["Actual"].max(), positive["Predicted"].max())
+ax.plot([low, high], [low, high], linestyle="--")
+ax.set_xscale("log")
+ax.set_yscale("log")
+ax.set_xlabel("Actual External Debt (Billions, log scale)")
+ax.set_ylabel("Predicted External Debt (Billions, log scale)")
+ax.set_title("RQ4: External Debt Prediction on Log Scales")
+plt.tight_layout()
+plt.show()
+```
+
+
+
+## 6.4 Actual vs. Predicted External Debt Prediction Analysis:
+The log-scale actual-versus-predicted plot shows that the Extra Trees model captures the broad magnitude of external debt reasonably well. Most observations follow the 45-degree reference line, particularly among countries with low to moderately high debt levels. This indicates that the model can generally distinguish between countries with relatively small, medium, and large external debt positions.
+However, substantial prediction errors remain, especially for countries with extremely large debt values. Several high-debt observations fall well below the reference line, indicating systematic underprediction of some extreme cases. Errors are also visible among countries with very small debt positions.
+The apparent fit in this figure should also be interpreted carefully because both axes are displayed on logarithmic scales. The log scale compresses large absolute differences, making predictions across several orders of magnitude easier to visualize. When predictions are evaluated on the original billion-dollar scale, the model achieves an R² of 0.4494, indicating only moderate predictive performance.
+Overall, the model is more successful at identifying the general order of magnitude of a country's external debt than at estimating its exact debt amount, particularly for extreme high-debt countries.
+
+
+
+
+
+
+
+## 6.5 Most Important Features
+
+```{python}
+rq4_importance = permutation_importance_table(rq4_best_model, X4, y4)
+display(rq4_importance)
+plot_importance(rq4_importance, "RQ4: Feature Importance for External Debt")
+```
+
+
+
+# RQ4 External Debt Feature Importance Analysis:
+HDI was the most influential predictor of external debt in the Extra Trees model, followed by internet usage and population-related variables. Unlike the earlier research questions, population size became substantially more important when predicting external debt. This suggests that country scale contains useful information for predicting absolute debt magnitude.
+Population and percentage of world population should not, however, be interpreted as independent effects because the two variables contain highly overlapping information. Their importance scores likely represent the same underlying population-size dimension. Similarly, the strong importance of HDI and internet usage may reflect broader differences in economic development and international financial participation rather than direct causal effects.
+These importance scores should also be interpreted within the model rather than compared numerically with importance scores from other research questions. Overall model performance remained moderate, with an R² of approximately 0.45, so the identified features provide useful but incomplete information about cross-country differences in external debt.
+
+
+## 6.6 Interpretation Guide
+
+This analysis predicts **total external debt**, not debt burden or financial risk. A large country can have high total debt simply because its economy and population are large. The dataset does not contain GDP, government revenue, debt-service costs, or credit ratings, so it cannot directly answer whether a country's debt is sustainable.
+
+
+
+
+# 7. RQ5 — Do Countries Form Distinct Development Profiles?
+
+## 7.1 Research Rationale
+
+The previous research questions use a defined target variable. This section instead asks whether countries naturally form broader development profiles based on demographic, technological, geographic, and economic characteristics.
+
+K-Means clustering is evaluated using both the **Elbow Method** and the **Silhouette Score**. The final solution is restricted to **3, 4, or 5 clusters** so that the profiles remain detailed enough to be informative without becoming unnecessarily fragmented.
+
+Highly redundant raw size variables are excluded so that the clusters are not dominated by country area. Population and external debt are log-transformed because both variables are strongly right-skewed. All clustering variables are standardized before K-Means because the features are measured on very different scales.
+
+## 7.2 Prepare Clustering Features
+
+```{python}
+cluster_features = [
+    "% water",
+    "Population",
+    "Population density",
+    "HDI",
+    "Fertility rate",
+    "Mortality rate",
+    "% of internet users in population",
+    "External debt (billions)"
+]
+
+cluster_df = df[["Country name"] + cluster_features].copy()
+
+# Reduce the influence of extreme right-skewed values.
+cluster_df["Population"] = np.log1p(cluster_df["Population"])
+cluster_df["External debt (billions)"] = np.log1p(
+    cluster_df["External debt (billions)"]
+)
+
+# Median imputation handles missing values, and standardization gives
+# each clustering feature a comparable scale.
+cluster_imputer = SimpleImputer(strategy="median")
+cluster_scaler = StandardScaler()
+
+X_cluster_imputed = cluster_imputer.fit_transform(
+    cluster_df[cluster_features]
+)
+
+X_cluster_scaled = cluster_scaler.fit_transform(
+    X_cluster_imputed
+)
+```
+
+## 7.3 Compare Candidate Cluster Solutions
+
+Inertia measures within-cluster compactness and is used for the Elbow Method, while the Silhouette Score evaluates both within-cluster cohesion and separation between clusters.
+
+```{python}
+cluster_scores = []
+
+for k in [2, 3, 4, 5, 6, 7, 8]:
+    km = KMeans(
+        n_clusters=k,
+        random_state=RANDOM_STATE,
+        n_init=20
+    )
+
+    labels = km.fit_predict(X_cluster_scaled)
+
+    cluster_scores.append({
+        "k": k,
+        "Inertia": km.inertia_,
+        "Silhouette": silhouette_score(
+            X_cluster_scaled,
+            labels
+        )
+    })
+
+cluster_scores = pd.DataFrame(cluster_scores)
+
+display(cluster_scores.round(4))
+```
+
+## 7.4 Elbow Method
+
+Inertia always decreases as more clusters are added, so the lowest inertia is not automatically the best solution. Instead, the Elbow Method looks for the point after which adding another cluster produces a noticeably smaller improvement.
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 4))
+
+ax.plot(
+    cluster_scores["k"],
+    cluster_scores["Inertia"],
+    marker="o"
+)
+
+ax.set_xlabel("Number of Clusters (k)")
+ax.set_ylabel("Inertia")
+ax.set_title("RQ5: Elbow Method for Selecting k")
+ax.set_xticks([2, 3, 4, 5, 6, 7, 8])
+
+plt.tight_layout()
+plt.show()
+```
+
+## 7.5 Silhouette Score
+
+A higher Silhouette Score indicates that countries are, on average, more similar to countries in their own cluster and more distinct from countries assigned to other clusters.
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 4))
+
+ax.plot(
+    cluster_scores["k"],
+    cluster_scores["Silhouette"],
+    marker="o"
+)
+
+ax.set_xlabel("Number of Clusters (k)")
+ax.set_ylabel("Silhouette Score")
+ax.set_title("RQ5: Silhouette Score for Selecting k")
+ax.set_xticks([2, 3, 4, 5, 6, 7, 8])
+
+plt.tight_layout()
+plt.show()
+```
+
+
+
+# 7.6 Select the Final Number of Clusters
+After comparing the Elbow Method and Silhouette Scores for k = 3, k = 4, and k = 5, four clusters are selected as the final solution.
+The Elbow Method shows that moving from three to four clusters provides a meaningful reduction in within-cluster variation, while adding a fifth cluster produces a smaller incremental improvement. The Silhouette Score is also considered to ensure that the four-cluster solution maintains reasonable cluster separation and cohesion.
+Although the solution with the highest Silhouette Score may not necessarily be k = 4, cluster selection should not rely on a single metric alone. The four-cluster solution provides a useful balance between statistical quality and interpretability, allowing the countries to be separated into more distinct development profiles without creating unnecessarily fragmented groups.
+Therefore, k = 4 is selected for the final K-Means model.
+
+
+
+```{python}
+
+# Final number of clusters selected after evaluating
+# both the Elbow Method and Silhouette Scores.
+
+best_k = 4
+
+selected_silhouette = float(
+    cluster_scores.loc[
+        cluster_scores["k"] == best_k,
+        "Silhouette"
+    ].iloc[0]
+)
+
+selected_inertia = float(
+    cluster_scores.loc[
+        cluster_scores["k"] == best_k,
+        "Inertia"
+    ].iloc[0]
+)
+
+print("Selected number of clusters:", best_k)
+print(f"Silhouette Score for k={best_k}: {selected_silhouette:.4f}")
+print(f"Inertia for k={best_k}: {selected_inertia:.2f}")
+
+
+
+```
+
+
+
+
+
+## 7.7 Fit the Final K-Means Model
+
+```{python}
+final_kmeans = KMeans(
+    n_clusters=best_k,
+    random_state=RANDOM_STATE,
+    n_init=20
+)
+
+cluster_df["Cluster"] = final_kmeans.fit_predict(
+    X_cluster_scaled
+)
+
+cluster_output = df.copy()
+cluster_output["Cluster"] = cluster_df["Cluster"]
+
+display(
+    cluster_output[["Country name", "Cluster"]].head(20)
+)
+```
+
+
+
+
+## 7.8 Cluster Profiles
+
+The following table returns to the original, interpretable units rather than the standardized values used by K-Means. These averages help describe how the final clusters differ in development, demography, internet access, population density, and external debt.
+
+```{python}
+profile_columns = [
+    "Population density",
+    "HDI",
+    "Fertility rate",
+    "Mortality rate",
+    "% of internet users in population",
+    "External debt (billions)"
+]
+
+cluster_profiles = (
+    cluster_output
+    .groupby("Cluster")[profile_columns]
+    .mean()
+    .round(3)
+)
+
+cluster_sizes = (
+    cluster_output["Cluster"]
+    .value_counts()
+    .sort_index()
+    .rename("Countries")
+)
+
+cluster_profiles = cluster_profiles.join(cluster_sizes)
+
+display(cluster_profiles)
+```
+
+
+
+
+# Cluster Profile Analysis:
+The four-cluster solution reveals three broad development profiles and one highly unusual outlier cluster. Cluster 0, containing 83 countries, represents a moderate-development profile, with an average HDI of 0.755, internet usage of approximately 80%, and fertility close to replacement level. Cluster 1 contains 62 countries and represents the most highly developed profile, characterized by the highest average HDI (0.875), high internet usage (89.8%), the lowest fertility rate (1.51), and substantially higher external debt.
+Cluster 3, containing 49 countries, represents a lower-development and higher-fertility profile. It has the lowest average HDI (0.543) and internet usage (31.4%), while its average fertility rate of 3.834 is considerably higher than those of Clusters 0 and 1. These differences reinforce the broader relationship among human development, technological access, and demographic characteristics observed in the earlier research questions.
+Cluster 2 requires a different interpretation. It contains only one country and has an exceptionally high population density of 19,428.5 people per square kilometer. Rather than representing a broad development profile, this cluster appears to isolate an extreme population-density observation. Its HDI is missing in the original data, so no cluster-level HDI interpretation can be made for this group.
+Overall, the four-cluster solution identifies meaningful differences among countries, but the highly unbalanced size of Cluster 2 demonstrates an important limitation of K-Means: extreme observations can form very small clusters. Therefore, the results support the existence of broad country development profiles, while also showing that not every cluster should be interpreted as an equally generalizable development category.
+
+
+
+
+
+```{python}
+
+
+cluster_2_rows = cluster_output[
+    cluster_output["Cluster"] == 2
+]
+
+display(cluster_2_rows)
+
+
+
+```
+
+# Cluster Profile Analysis Summary:
+Cluster 0: Moderate Development
+Cluster 1: High Development & High External Debt
+Cluster 2: Extreme Population-Density Outlier (Monaco)
+Cluster 3: Lower Development & High Fertility
+
+
+# critical finding：
+Although four clusters were selected using the Elbow Method and Silhouette Score, one cluster contains only Monaco. Its exceptionally high population density causes K-Means to isolate it from the other countries. Therefore, the four-cluster solution should not be interpreted as four equally generalizable development profiles.
+
+
+
+## 7.9 PCA Visualization of Country Profiles
+
+PCA reduces the standardized clustering variables to two dimensions for visualization only. The K-Means model itself still uses all eight clustering features. Therefore, PC1 and PC2 should be interpreted as compressed combinations of the original variables rather than individual country characteristics.
+
+```{python}
+pca = PCA(n_components=2)
+coords = pca.fit_transform(X_cluster_scaled)
+
+pca_df = pd.DataFrame({
+    "Country name": cluster_df["Country name"],
+    "PC1": coords[:, 0],
+    "PC2": coords[:, 1],
+    "Cluster": cluster_df["Cluster"]
+})
+
+fig, ax = plt.subplots(figsize=(9, 6))
+
+for cluster_id in sorted(pca_df["Cluster"].unique()):
+    subset = pca_df[pca_df["Cluster"] == cluster_id]
+
+    ax.scatter(
+        subset["PC1"],
+        subset["PC2"],
+        label=f"Cluster {cluster_id}",
+        alpha=0.75
+    )
+
+ax.set_xlabel(
+    f"PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)"
+)
+ax.set_ylabel(
+    f"PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)"
+)
+ax.set_title("RQ5: PCA View of Country Development Profiles")
+ax.legend()
+
+plt.tight_layout()
+plt.show()
+
+print(
+    "Variance explained by PC1 and PC2:",
+    f"{pca.explained_variance_ratio_.sum():.1%}"
+)
+```
+
+## 7.10 Countries in Each Cluster
+
+Listing the countries in each group helps determine whether the statistical profiles also form interpretable real-world country groupings.
+
+```{python}
+for cluster_id in sorted(cluster_output["Cluster"].unique()):
+    countries = (
+        cluster_output.loc[
+            cluster_output["Cluster"] == cluster_id,
+            "Country name"
+        ]
+        .sort_values()
+        .tolist()
+    )
+
+    print(f"\nCluster {cluster_id} ({len(countries)} countries):")
+    print(", ".join(countries))
+```
+
+
+
+
+
+
+# RQ5 — Cluster Analysis and Real-World Interpretation
+The four-cluster solution captures several meaningful real-world patterns, although the groups should not be interpreted as strict development rankings. 
+
+Cluster 1 most clearly represents relatively developed and economically integrated countries. It includes many advanced economies such as the United States, Canada, Japan, South Korea, Germany, France, the United Kingdom, Australia, and much of Europe. This is consistent with the cluster's high average HDI (0.875), high internet usage (89.8%), low fertility rate (1.51), and substantially higher external debt. However, the cluster also contains large emerging economies such as China, India, Brazil, Indonesia, and Mexico. This suggests that K-Means is capturing a combination of development and economic scale rather than simply separating countries into “developed” and “developing” categories.
+
+Cluster 0 is more heterogeneous. It contains many middle-development countries, small island states, and wealthy but relatively small economies, including the UAE, Qatar, Kuwait, Iceland, and several Caribbean and Pacific countries. Its average HDI of 0.755 and internet usage of 80.0% place it between Clusters 1 and 3. The presence of both wealthy small states and less-developed countries indicates that similar combinations of population size, debt, demographic characteristics, and internet access can place countries in the same statistical cluster even when their economic circumstances differ substantially.
+
+Cluster 3 has the clearest lower-development pattern. Many Sub-Saharan African countries are included, along with Afghanistan, Haiti, Pakistan, Yemen, and several countries affected by economic or political instability. This cluster has the lowest average HDI (0.543) and internet usage (31.4%) and the highest fertility rate (3.83). These characteristics are broadly consistent with real-world differences in development and demographic transition, making Cluster 3 one of the most interpretable groups in the analysis.
+Finally, Cluster 2 contains only Monaco. Its extremely high population density (19,428.5 people per km²) makes it fundamentally different from the rest of the dataset, causing K-Means to isolate it into a separate cluster. Therefore, 
+
+Cluster 2 should be interpreted as an outlier cluster rather than a general development profile.
+
+Overall, the clustering produces meaningful broad patterns, particularly in distinguishing higher-development and lower-development groups, but it also demonstrates an important limitation of unsupervised learning: countries with very different real-world economic structures can appear similar mathematically, while extreme observations such as Monaco can form clusters of their own. Thus, the results are best interpreted as multidimensional statistical country profiles rather than definitive classifications of national development.
+
+
+
+
+
+
+
+# 8. Final Model Summary
+
+The final table summarizes all five research questions. For RQ1-RQ4, models are selected using cross-validated MAE as the primary metric. RQ5 is an unsupervised clustering problem, so regression error metrics do not apply; its final solution is evaluated using the selected number of clusters and Silhouette Score.
+
+```{python}
+selected_cluster_silhouette = float(
+    cluster_scores.loc[
+        cluster_scores["k"] == best_k,
+        "Silhouette"
+    ].iloc[0]
+)
+
+final_model_summary = pd.DataFrame([
+    {
+        "Research Question": "RQ1 — HDI",
+        "Task": "Regression",
+        "Selected Model": rq1_best_name,
+        "Primary Metric": "CV MAE",
+        "Primary Score": rq1_results.iloc[0]["MAE"],
+        "CV RMSE": rq1_results.iloc[0]["RMSE"],
+        "CV R2": rq1_results.iloc[0]["R2"]
+    },
+    {
+        "Research Question": "RQ2 — Fertility Rate",
+        "Task": "Regression",
+        "Selected Model": rq2_best_name,
+        "Primary Metric": "CV MAE",
+        "Primary Score": rq2_results.iloc[0]["MAE"],
+        "CV RMSE": rq2_results.iloc[0]["RMSE"],
+        "CV R2": rq2_results.iloc[0]["R2"]
+    },
+    {
+        "Research Question": "RQ3 — Mortality Rate",
+        "Task": "Regression",
+        "Selected Model": rq3_best_name,
+        "Primary Metric": "CV MAE",
+        "Primary Score": rq3_results.iloc[0]["MAE"],
+        "CV RMSE": rq3_results.iloc[0]["RMSE"],
+        "CV R2": rq3_results.iloc[0]["R2"]
+    },
+    {
+        "Research Question": "RQ4 — External Debt",
+        "Task": "Log-target Regression",
+        "Selected Model": rq4_best_name,
+        "Primary Metric": "CV MAE",
+        "Primary Score": rq4_results.iloc[0]["MAE"],
+        "CV RMSE": rq4_results.iloc[0]["RMSE"],
+        "CV R2": rq4_results.iloc[0]["R2"]
+    },
+    {
+        "Research Question": "RQ5 — Country Profiles",
+        "Task": "K-Means Clustering",
+        "Selected Model": f"K-Means (k={best_k})",
+        "Primary Metric": "Silhouette",
+        "Primary Score": selected_cluster_silhouette,
+        "CV RMSE": np.nan,
+        "CV R2": np.nan
+    }
+])
+
+display(final_model_summary.round(4))
+```
+
+
+
+# Overall Model Selection and Limitations
+Extra Trees was selected as the best-performing model for all four supervised research questions based primarily on cross-validated MAE. This consistency is reasonable because country-level demographic and socioeconomic relationships are unlikely to be purely linear. Compared with Ridge Regression, Extra Trees can capture nonlinear relationships and interactions among variables without requiring them to be specified in advance. Its strong performance relative to Ridge, particularly for HDI and fertility prediction, suggests that nonlinear structure is important in this dataset.
+However, selecting Extra Trees as the best model does not imply that it performed equally well for every research question. Performance varied substantially across outcomes. The model achieved strong predictive performance for HDI (R² = 0.8123) and relatively good performance for fertility rate (R² = 0.7147), but only moderate performance for external debt (R² = 0.4494) and weak performance for mortality rate (R² = 0.2806). Therefore, Extra Trees should be interpreted as the best model among the candidate models tested, rather than as a universally strong predictor.
+Several limitations should also be considered. Extra Trees is less directly interpretable than a linear model, and permutation feature importance measures predictive contribution rather than causal effects. Correlated predictors may also share or redistribute importance. In addition, the dataset contains only about 195 country-level observations, making model estimates potentially sensitive to unusual countries and extreme values. Finally, a flexible machine-learning model cannot compensate for important variables that are absent from the dataset. This is particularly relevant to mortality, where factors such as healthcare access, age structure, disease burden, and socioeconomic conditions may be necessary for stronger prediction.
+Overall, the repeated selection of Extra Trees suggests that nonlinear machine-learning methods are well suited to the structure of this dataset, while the large differences in R² across research questions demonstrate that predictive success depends not only on model choice but also on whether the available features contain sufficient information about the target.
+
+
+
+
+
+
+
+# 9. Discussion and Limitations
+
+The project approaches country-level differences from several angles rather than assuming that one outcome tells the whole story. HDI, fertility, mortality, and external debt represent different dimensions of development and demographic conditions, while clustering provides an unsupervised view of broader country profiles.
+
+When interpreting the results, focus on three things: **predictive performance**, **feature importance**, and **limitations**. A strong model indicates that the included variables contain useful predictive information. A weak model is also informative because it identifies an outcome that cannot be explained adequately with the current feature set.
+
+Important limitations include:
+
+- The dataset is cross-sectional, so the analysis cannot establish temporal or causal relationships.
+- Country-level averages can hide substantial within-country inequality and regional variation.
+- Several potentially important variables are absent, including GDP per capita, health expenditure, age structure, education measures, government revenue, conflict exposure, and debt-service burden.
+- Total external debt should not be interpreted as debt sustainability.
+- Correlated predictors can share predictive information, so feature importance should be interpreted as model-dependent rather than as a causal ranking.
+
+The strongest final report should therefore discuss not only which model performs best, but also **why some outcomes are easier to predict than others and what additional data would be needed to answer the weaker questions more convincingly**.
